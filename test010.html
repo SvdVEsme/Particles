@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js 2D Particle Repulsion with Two Gravity Circles and Speed-Based Colors</title>
+    <style>
+        /* Ensure the body and canvas take up the full window space */
+        body {
+            margin: 0;
+            overflow: hidden; /* Hide scrollbars */
+            background-color: #ffffff; /* White background for the scene */
+        }
+        canvas {
+            display: block; /* Remove extra space below canvas */
+        }
+    </style>
+</head>
+<body>
+    <!-- Three.js library from CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        // Global variables for Three.js components
+        let scene, camera, renderer;
+        let particles;
+
+        // Configuration for particle system
+        const particleCount = 75000; // Number of particles for a dense effect
+        const initialPositions = new Float32Array(particleCount * 3); // Stores original positions
+        const currentPositions = new Float32Array(particleCount * 3);  // Stores current positions
+        const velocities = new Float32Array(particleCount * 3);      // Stores particle velocities
+        const effectiveness = new Float32Array(particleCount);       // Stores individual particle effectiveness (for general force)
+        const repelForces = new Float32Array(particleCount);         // Stores individual particle repulsion force
+        const returnSpeeds = new Float32Array(particleCount);        // Stores individual particle return speed
+        // NEW: Array to store individual particle colors (RGB values)
+        const colors = new Float32Array(particleCount * 3);
+
+        // Mouse interaction variables
+        const mouse = new THREE.Vector2(); // Normalized mouse coordinates (-1 to +1)
+        const raycaster = new THREE.Raycaster(); // Used to project mouse position into 3D space
+
+        // Parameters for general particle behavior
+        const DAMPING_FACTOR = 0.90; // Reduces particle velocity over time (friction-like)
+        const BOUNCE_DAMPING = 0.8; // Factor to reduce velocity upon bounce (prevents infinite bouncing)
+
+        // Range for particle effectiveness (e.g., from 0.01 to 1.0 times the base force)
+        const EFFECTIVENESS_MIN = 0.01;
+        const EFFECTIVENESS_MAX = 1.0;
+
+        // Range for individual particle repulsion force
+        const REPEL_FORCE_MIN = 1.0; // Minimum repulsion force for a particle
+        const REPEL_FORCE_MAX = 9.0; // Maximum repulsion force for a particle
+
+        // Range for individual particle return speed
+        const RETURN_SPEED_MIN = 0.005; // Minimum return speed for a particle
+        const RETURN_SPEED_MAX = 0.01; // Maximum return speed for a particle
+
+        // NEW: Color constants for particle speed
+        const COLOR_LOW_SPEED = new THREE.Color(0xffffff); // Gray for low speed
+        const COLOR_HIGH_SPEED = new THREE.Color(0xffcc00); // Orange/yellow for high speed
+        const MAX_PARTICLE_SPEED = 0.12; // Max speed for color mapping. Adjust this based on observed particle speeds.
+
+        // Dynamic world dimensions, calculated based on camera and screen size
+        let WORLD_WIDTH = 0;
+        const WORLD_HEIGHT_REFERENCE = 200; // Reference height for the simulation area, camera Z will be adjusted to fit this
+
+        // --- UPDATED: Two Gravity Circles Variables ---
+        // Defines the properties of the two transparent circles that attract particles
+        const gravityCircles = [
+            {
+                position: new THREE.Vector3(0, 0, 0), // Initial position for circle 1
+                velocity: new THREE.Vector3(0, 0, 0),
+                radius: 20, // Smaller radius for individual circles
+                attractionStrength: 0.001, // Slower attraction
+                damping: 0.99, // More damping
+                mesh: null // To hold the visual mesh for this circle
+            },
+            {
+                position: new THREE.Vector3(0, 0, 0), // Initial position for circle 2
+                velocity: new THREE.Vector3(0, 0, 0),
+                radius: 15, // Smallest radius
+                attractionStrength: 0.003, // Medium attraction
+                damping: 0.97, // Medium damping
+                mesh: null
+            }
+            // Circle 3 has been removed as per request
+        ];
+
+        /**
+         * Initializes the Three.js scene, camera, and renderer,
+         * creates the particle system, and sets up event listeners.
+         */
+        function init() {
+            // Scene: Container for all objects, lights, and cameras
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xffffff); // Set background to white
+
+            // Camera: Defines what is visible in the scene
+            // PerspectiveCamera(FOV, Aspect Ratio, Near Clip, Far Clip)
+            camera = new THREE.PerspectiveCamera(
+                20, // Field of view (degrees)
+                window.innerWidth / window.innerHeight, // Aspect ratio (will be updated on resize)
+                0.1,  // Near clipping plane
+                1000  // Far clipping plane
+            );
+
+            // Renderer: Renders the scene using WebGL
+            renderer = new THREE.WebGLRenderer({ antialias: true }); // Antialiasing for smoother edges
+            document.body.appendChild(renderer.domElement); // Add renderer's DOM element to the body
+
+            // Call onWindowResize immediately to set initial size and camera position
+            onWindowResize();
+
+            // Create the particle system
+            createParticles();
+
+            // --- UPDATED: Create visual representations for all gravity circles (optional) ---
+            const circleMaterial = new THREE.MeshBasicMaterial({
+                color: 0xffcc00, // A color for the circles
+                transparent: true, // Make the material transparent
+                opacity: 0.0, // Set opacity to 0.0 (fully transparent)
+                side: THREE.DoubleSide // Render both sides of the circle plane
+            });
+
+            gravityCircles.forEach(circle => {
+                const circleGeometry = new THREE.CircleGeometry(circle.radius, 64); // Create a circle geometry based on its radius
+                circle.mesh = new THREE.Mesh(circleGeometry, circleMaterial); // Create the mesh
+                scene.add(circle.mesh); // Add the mesh to the scene
+            });
+
+            // Add event listeners for responsiveness and interaction
+            window.addEventListener('resize', onWindowResize, false); // Handle window resizing
+            document.addEventListener('mousemove', onMouseMove, false); // Handle mouse movement
+
+            // Start the animation loop
+            animate();
+        }
+
+        /**
+         * Creates and adds a particle system to the scene.
+         * Particles are randomly distributed within a 2D plane (Z = 0)
+         * that matches the calculated `WORLD_WIDTH` and `WORLD_HEIGHT_REFERENCE`.
+         * Each particle is assigned random 'effectiveness', 'repelForce', and 'returnSpeed' values.
+         */
+        function createParticles() {
+            // BufferGeometry is efficient for storing large amounts of vertex data
+            const geometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(particleCount * 3); // Array to hold x, y, z for each particle
+
+            // Generate random positions for each particle within the 2D plane
+            for (let i = 0; i < particleCount; i++) {
+                const i3 = i * 3; // Index for current particle's x, y, z
+
+                // Random positions within the calculated world boundaries, centered at (0,0,0) on Z=0
+                positions[i3] = (Math.random() - 0.5) * WORLD_WIDTH; // X coordinate
+                positions[i3 + 1] = (Math.random() - 0.5) * WORLD_HEIGHT_REFERENCE; // Y coordinate
+                positions[i3 + 2] = 0; // Z coordinate is fixed at 0 for 2D plane
+
+                // Store initial and current positions for motion calculation
+                initialPositions[i3] = positions[i3];
+                initialPositions[i3 + 1] = positions[i3 + 1];
+                initialPositions[i3 + 2] = positions[i3 + 2]; // Store 0 for initial Z
+
+                currentPositions[i3] = positions[i3];
+                currentPositions[i3 + 1] = positions[i3 + 1];
+                currentPositions[i3 + 2] = positions[i3 + 2]; // Current Z also starts at 0
+
+                // Initialize particle velocities to zero
+                velocities[i3] = 0;
+                velocities[i3 + 1] = 0;
+                velocities[i3 + 2] = 0;
+
+                // Assign a random effectiveness value to each particle
+                effectiveness[i] = EFFECTIVENESS_MIN + Math.random() * (EFFECTIVENESS_MAX - EFFECTIVENESS_MIN);
+                // Assign a random repel force value to each particle
+                repelForces[i] = REPEL_FORCE_MIN + Math.random() * (REPEL_FORCE_MAX - REPEL_FORCE_MIN);
+                // Assign a random return speed value to each particle
+                returnSpeeds[i] = RETURN_SPEED_MIN + Math.random() * (RETURN_SPEED_MAX - RETURN_SPEED_MIN);
+
+                // Set initial color for particles (low speed color)
+                colors[i3] = COLOR_LOW_SPEED.r;
+                colors[i3 + 1] = COLOR_LOW_SPEED.g;
+                colors[i3 + 2] = COLOR_LOW_SPEED.b;
+            }
+
+            // Set the position attribute for the geometry using the currentPositions array
+            geometry.setAttribute('position', new THREE.BufferAttribute(currentPositions, 3));
+            // NEW: Add color attribute to the geometry
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+
+            // PointsMaterial defines how particles look. Size is fixed, so they will all appear the same.
+            const material = new THREE.PointsMaterial({
+                size: 1.8,       // Size of each particle (fixed, so all look the same size)
+                transparent: false,
+                opacity: 0.7,
+                vertexColors: true // NEW: Enable vertex colors for individual particle coloring
+                //blending: THREE.AdditiveBlending // Makes particles blend together, creating a glowing effect
+            });
+
+            // Create the Points object (the particle system) and add it to the scene
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+        }
+
+        /**
+         * Handles window resize events to make the scene responsive.
+         * Updates camera aspect ratio, renderer size, and recalibrates
+         * the camera's Z position and world boundaries to fit the screen.
+         */
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight; // Update camera's aspect ratio
+            
+            // Calculate camera Z position to fit WORLD_HEIGHT_REFERENCE vertically in view
+            // vFOV is the vertical field of view in radians
+            const vFOV = THREE.MathUtils.degToRad(camera.fov);
+            // Calculate the required distance from the camera to the plane at Z=0
+            // so that WORLD_HEIGHT_REFERENCE fits exactly in the vertical view.
+            camera.position.z = (WORLD_HEIGHT_REFERENCE / 2) / Math.tan(vFOV / 2);
+            
+            camera.updateProjectionMatrix(); // Recalculate projection matrix for new aspect ratio and Z position
+
+            renderer.setSize(window.innerWidth, window.innerHeight); // Resize the renderer
+
+            // Calculate the actual visible world width at the Z=0 plane based on the new camera settings
+            WORLD_WIDTH = WORLD_HEIGHT_REFERENCE * camera.aspect;
+        }
+
+        /**
+         * Handles mouse movement events.
+         * Converts pixel coordinates to normalized device coordinates (-1 to +1).
+         */
+        function onMouseMove(event) {
+            // Normalize mouse X coordinate: (mouse_x / window_width) * 2 - 1
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            // Normalize mouse Y coordinate: -(mouse_y / window_height) * 2 + 1 (Y-axis is inverted in Three.js)
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+        }
+
+        /**
+         * The main animation loop.
+         * Requests the next frame and updates the gravity circles and particles.
+         */
+        function animate() {
+            requestAnimationFrame(animate); // Request the next animation frame
+
+            updateGravityCircles(); // Update all gravity circles' positions
+            updateParticles();     // Update particle positions and apply forces (now from closest gravity circle)
+
+            renderer.render(scene, camera); // Render the scene with the camera
+        }
+
+        /**
+         * Updates the position and velocity of all gravity circles.
+         * Each circle is attracted to the mouse cursor's position independently.
+         */
+        function updateGravityCircles() {
+            // Project the 2D mouse coordinates onto the 3D plane where particles reside (Z=0).
+            raycaster.setFromCamera(mouse, camera);
+            const intersectPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0); // A plane at Z=0
+            const mouseTargetPoint = new THREE.Vector3();
+            // Get the intersection point of the ray with the plane, which is our 3D mouse target
+            raycaster.ray.intersectPlane(intersectPlane, mouseTargetPoint);
+
+            gravityCircles.forEach(circle => {
+                // Calculate the vector from the current gravity circle position to the mouse target
+                const attractionDirection = new THREE.Vector3().subVectors(mouseTargetPoint, circle.position);
+                
+                // Calculate the attraction force based on strength and apply to velocity
+                attractionDirection.multiplyScalar(circle.attractionStrength);
+                circle.velocity.add(attractionDirection);
+
+                // Apply damping to the gravity circle's velocity to create a smooth, non-oscillating movement
+                circle.velocity.multiplyScalar(circle.damping);
+
+                // Update the gravity circle's position based on its velocity
+                circle.position.add(circle.velocity);
+
+                // If a visual mesh for the gravity circle exists, update its position to match
+                if (circle.mesh) {
+                    circle.mesh.position.copy(circle.position);
+                }
+            });
+        }
+
+
+        /**
+         * Updates each particle's position based on repulsion from the closest gravity circle,
+         * a force that pulls them back to their initial positions,
+         * and applies bouncing logic at the screen edges.
+         */
+        function updateParticles() {
+            // Half dimensions for boundary checking, used for particle bouncing
+            const halfWorldWidth = WORLD_WIDTH / 2;
+            const halfWorldHeight = WORLD_HEIGHT_REFERENCE / 2;
+
+            // Loop through all particles to apply forces
+            for (let i = 0; i < particleCount; i++) {
+                const i3 = i * 3; // Index for current particle's x, y, z components
+
+                // Get current particle position
+                let px = currentPositions[i3];
+                let py = currentPositions[i3 + 1];
+                let pz = currentPositions[i3 + 2];
+
+                // Get initial particle position
+                const ix = initialPositions[i3];
+                const iy = initialPositions[i3 + 1];
+                const iz = initialPositions[i3 + 2];
+
+                // --- Repulsion Logic (from closest gravityCircle.position) ---
+                let closestCircle = null;
+                let minDistanceSq = Infinity;
+
+                // Find the closest gravity circle to the current particle
+                gravityCircles.forEach(circle => {
+                    const dx_c = px - circle.position.x;
+                    const dy_c = py - circle.position.y;
+                    const dz_c = pz - circle.position.z;
+                    const distanceSq_c = dx_c * dx_c + dy_c * dy_c + dz_c * dz_c;
+
+                    if (distanceSq_c < minDistanceSq) {
+                        minDistanceSq = distanceSq_c;
+                        closestCircle = circle;
+                    }
+                });
+
+                // Only apply repulsion if a closest circle is found and the particle is within its radius
+                if (closestCircle && minDistanceSq < closestCircle.radius * closestCircle.radius && minDistanceSq > 1e-6) {
+                    const distance = Math.sqrt(minDistanceSq); // Actual distance
+                    // Calculate repulsion force strength: stronger when closer to the gravity circle
+                    // The force also scales by individual particle effectiveness and repulsion force.
+                    const force = (1 - (distance / closestCircle.radius)) * repelForces[i] * effectiveness[i];
+                    
+                    // Calculate direction vector from closest circle to particle
+                    const dx = px - closestCircle.position.x;
+                    const dy = py - closestCircle.position.y;
+                    const dz = pz - closestCircle.position.z;
+
+                    // Apply force along the normalized direction vector
+                    velocities[i3] += (dx / distance) * force;
+                    velocities[i3 + 1] += (dy / distance) * force;
+                    velocities[i3 + 2] += (dz / distance) * force;
+                }
+
+                // Apply damping to current particle velocities to gradually slow them down (friction)
+                velocities[i3] *= DAMPING_FACTOR;
+                velocities[i3 + 1] *= DAMPING_FACTOR;
+                velocities[i3 + 2] *= DAMPING_FACTOR;
+
+                // --- Return to Original Position Logic ---
+                // Calculate vector from current position back to initial position
+                const returnDx = ix - px;
+                const returnDy = iy - py;
+                const returnDz = iz - pz;
+                const returnDistanceSq = returnDx * returnDx + returnDy * returnDy + returnDz * returnDz;
+
+                // Only apply return force if particle is displaced significantly from its initial position
+                if (returnDistanceSq > 1e-6) {
+                    const returnDistance = Math.sqrt(returnDistanceSq);
+                    // Apply a force that pulls the particle back towards its initial spot,
+                    // using its individual return speed.
+                    velocities[i3] += (returnDx / returnDistance) * returnSpeeds[i];
+                    velocities[i3 + 1] += (returnDy / returnDistance) * returnSpeeds[i];
+                    velocities[i3 + 2] += (returnDz / returnDistance) * returnSpeeds[i];
+                }
+
+                // Update the current position based on the calculated velocity
+                px += velocities[i3];
+                py += velocities[i3 + 1];
+                pz += velocities[i3 + 2];
+
+                // --- Bouncing Logic (for X-axis) ---
+                // If particle hits the left/right boundary, clamp position and reverse/dampen velocity
+                if (px > halfWorldWidth) {
+                    px = halfWorldWidth; // Clamp position to the boundary
+                    velocities[i3] *= -BOUNCE_DAMPING; // Reverse and dampen velocity
+                } else if (px < -halfWorldWidth) {
+                    px = -halfWorldWidth; // Clamp position to the boundary
+                    velocities[i3] *= -BOUNCE_DAMPING; // Reverse and dampen velocity
+                }
+
+                // --- Bouncing Logic (for Y-axis) ---
+                // If particle hits the top/bottom boundary, clamp position and reverse/dampen velocity
+                if (py > halfWorldHeight) {
+                    py = halfWorldHeight; // Clamp position to the boundary
+                    velocities[i3 + 1] *= -BOUNCE_DAMPING; // Reverse and dampen velocity
+                } else if (py < -halfWorldHeight) {
+                    py = -halfWorldHeight; // Clamp position to the boundary
+                    velocities[i3 + 1] *= -BOUNCE_DAMPING; // Reverse and dampen velocity
+                }
+
+                // Update current positions in the array with the newly calculated and bounced values
+                currentPositions[i3] = px;
+                currentPositions[i3 + 1] = py;
+                currentPositions[i3 + 2] = pz; // Z should remain near 0 as it's a 2D simulation
+
+                // NEW: Update particle color based on speed
+                const speed = Math.sqrt(
+                    velocities[i3] * velocities[i3] +
+                    velocities[i3 + 1] * velocities[i3 + 1] +
+                    velocities[i3 + 2] * velocities[i3 + 2]
+                );
+                // Normalize speed to a 0-1 range based on MAX_PARTICLE_SPEED
+                const normalizedSpeed = Math.min(1, speed / MAX_PARTICLE_SPEED);
+                // Interpolate color between low and high speed colors
+                const interpolatedColor = new THREE.Color().lerpColors(COLOR_LOW_SPEED, COLOR_HIGH_SPEED, normalizedSpeed);
+
+                colors[i3] = interpolatedColor.r;
+                colors[i3 + 1] = interpolatedColor.g;
+                colors[i3 + 2] = interpolatedColor.b;
+            }
+
+            // Inform Three.js that the position and color attributes need to be updated in the GPU
+            particles.geometry.attributes.position.needsUpdate = true;
+            particles.geometry.attributes.color.needsUpdate = true; // NEW: Mark colors attribute for update
+        }
+
+        // Start the initialization function when the entire window has loaded
+        window.onload = init;
+    </script>
+</body>
+</html>
